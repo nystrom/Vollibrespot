@@ -11,24 +11,20 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-env_logger =  {version = "0.7", default-features = false, features = ["termcolor","humantime","atty"]} 
-futures = "0.1"
+env_logger = { version = "0.10", default-features = false, features = ["color", "humantime"] }
+futures = "0.3"
 getopts = "0.2"
-hyper = "0.12"
 log = "0.4"
-tokio = "0.1"
-tokio-signal = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "signal", "time", "net"] }
 url = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha-1 = "0.8"
+sha1 = "0.10"
 hex = "0.4"
 toml = "0.5"
 
 [dependencies.librespot]
-git = "https://github.com/ashthespy/librespot"
-branch="vollibrespot"
-# path = "../librespot"
+version = "0.4.2"
 default-features = false
 features = ["alsa-backend"]
 

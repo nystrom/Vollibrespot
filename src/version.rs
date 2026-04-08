@@ -1,14 +1,11 @@
 #![allow(dead_code)]
-use librespot::core;
 
 pub fn version() -> String {
     format!(
-        "vollibrespot v{} {} {} (librespot {} {}) -- Built On {}",
+        "vollibrespot v{} {} {} -- Built On {}",
         semver(),
         short_sha(),
         commit_date(),
-        core::version::short_sha(),
-        core::version::commit_date(),
         short_now()
     )
 }

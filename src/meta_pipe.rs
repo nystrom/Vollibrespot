@@ -1,35 +1,21 @@
-use futures::Future;
 use librespot::{
     connect::spirc::Spirc,
     core::{
-        events::Event,
         keymaster,
         session::Session,
         spotify_id::{SpotifyAudioType, SpotifyId},
     },
     metadata::{Album, Artist, Episode, Metadata, Show, Track},
+    playback::player::{PlayerEvent, PlayerEventChannel},
 };
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
-    io::ErrorKind,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{
-        mpsc::{channel, Receiver, RecvTimeoutError, Sender, TryRecvError},
-        Arc,
-    },
-    thread,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
-
-// This is not really required at this stage
-#[derive(Debug)]
-struct TrackMeta {
-    track: Option<Track>,
-    album: Option<Album>,
-    artist: Option<Vec<Artist>>,
-    json: Value,
-}
+use tokio::net::UdpSocket;
 
 #[derive(Debug, Serialize)]
 #[allow(non_camel_case_types)]
@@ -55,11 +41,10 @@ pub enum MetaMsgs<'a> {
     kSpDeviceInactive,
     kSpSinkActive,
     kSpSinkInactive,
-    token(keymaster::Token),
     position_ms(u32),
     volume(f64),
     state { status: &'a str },
-    pong(PipeMsgs), // metadata(String),
+    pong(PipeMsgs),
 }
 
 impl<'a> std::fmt::Display for MetaMsgs<'a> {
@@ -75,364 +60,364 @@ pub struct MetaPipeConfig {
 }
 
 pub struct MetaPipe {
-    pub thread_handle: Option<thread::JoinHandle<()>>,
-    task_tx: Option<Sender<MetaThreadTask>>,
-}
-
-enum MetaThreadTask {
-    Reconnect,
-}
-
-struct MetaPipeThread {
-    session: Session,
-    config: MetaPipeConfig,
-    task_rx: Receiver<MetaThreadTask>,
-    event_rx: Receiver<Event>,
-    udp_socket: Option<UdpSocket>,
-    token_info: Option<(Instant, Duration)>,
-    buf: [u8; 2],
-    spirc: Arc<Spirc>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 const SCOPES: &str = "streaming,user-read-playback-state,user-modify-playback-state,user-read-currently-playing,user-read-private,user-library-modify,user-top-read,user-read-recently-played,user-library-read,playlist-read-private,playlist-read-collaborative";
 const CLIENT_ID: Option<&'static str> = option_env!("CLIENT_ID");
 
-#[derive(Debug)]
-enum Empty {}
-
 impl MetaPipe {
     pub fn new(
         config: MetaPipeConfig,
         session: Session,
-        event_rx: Receiver<Event>,
+        event_rx: PlayerEventChannel,
         spirc: Arc<Spirc>,
     ) -> MetaPipe {
-        let (task_tx, task_rx) = channel::<MetaThreadTask>();
-        let handle = thread::spawn(move || {
-            debug!("Starting new MetaPipe[{}]", session.session_id());
-
-            let meta_thread = MetaPipeThread {
-                session,
-                config,
-                task_rx,
-                event_rx,
-                udp_socket: None,
-                token_info: None,
-                buf: [0u8; 2],
-                spirc,
-            };
-
-            meta_thread.run();
-        });
-
-        MetaPipe {
-            thread_handle: Some(handle),
-            task_tx: Some(task_tx),
-        }
-    }
-
-    #[allow(dead_code)]
-    #[allow(unused_variables)]
-    pub fn reconnect(&mut self, session: Session, event_rx: Receiver<Event>, spirc: Arc<Spirc>) {
-        warn!("Reconnecting with SessionID: {}", session.session_id());
-        if let Some(tx) = &self.task_tx {
-            tx.send(MetaThreadTask::Reconnect)
-                .expect("Failed reconnecting MetaPipe")
-        }
-    }
-}
-
-impl MetaPipeThread {
-    fn run(mut self) {
-        self.init_socket();
-
-        loop {
-            let mut got_volumio_msg = false;
-
-            if self.session.is_invalid() {
-                error!("Session no longer valid");
-                break;
-            }
-
-            match self.task_rx.try_recv() {
-                Ok(_) => (),
-                Err(TryRecvError::Empty) => (),
-                Err(TryRecvError::Disconnected) => break,
-            }
-
-            match self.event_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(event) => self.handle_event(event),
-                Err(RecvTimeoutError::Timeout) => (),
-                Err(RecvTimeoutError::Disconnected) => {
-                    warn!("EventSender disconnected");
-                    self.send_meta(&MetaMsgs::kSpPlaybackInactive.to_string());
-                    break;
-                }
-            }
-            if let Some(token_info) = self.token_info {
-                if token_info.0.elapsed() > token_info.1 {
-                    info!("API Token expired, refreshing...");
-                    self.request_access_token();
-                }
-            }
-
-            if let Some(ref udp_socket) = self.udp_socket {
-                match udp_socket.recv(&mut self.buf) {
-                    Ok(_nbytes) => {
-                        got_volumio_msg = true;
-                    }
-                    Err(ref err) if err.kind() != ErrorKind::WouldBlock => warn!("WouldBlock"),
-                    _ => (),
-                }
-            }
-
-            if got_volumio_msg {
-                self.handle_volumio_msg(); // Meh pass in the message
-            }
-        }
-        self.send_meta(&MetaMsgs::kSpSinkInactive.to_string());
-    }
-
-    fn init_socket(&mut self) {
-        // Todo switch to multicast
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), self.config.port + 1);
-        let soc = UdpSocket::bind(addr).expect("Error starting Metadata pipe: ");
-        soc.set_nonblocking(true).expect("Error starting Metadata pipe: ");
-        self.udp_socket = Some(soc);
-        info!("Metadata pipe established");
-        let ver = self.config.version.clone();
-        self.send_meta(&ver);
-    }
-
-    fn handle_event(&mut self, event: Event) {
-        info!("Event: {:?}", event);
-        match event {
-            Event::Load { track_id } => {
-                self.handle_track_id(track_id, None);
-            }
-            Event::Play {
-                track_id,
-                position_ms,
-            } => {
-                self.send_meta(&serde_json::to_string(&MetaMsgs::state { status: "play" }).unwrap());
-                self.handle_track_id(track_id, Some(position_ms));
-            }
-            Event::Pause {
-                track_id,
-                position_ms,
-            } => {
-                self.send_meta(&serde_json::to_string(&MetaMsgs::state { status: "pause" }).unwrap());
-                self.handle_track_id(track_id, Some(position_ms));
-            }
-            Event::TrackChanged { track_id, .. } => {
-                // self.send_meta(&serde_json::to_string(&MetaMsgs::state { status: "play" }).unwrap());
-                self.handle_track_id(track_id, None);
-            }
-            Event::PlaybackLoading { .. } => {
-                // self.handle_track_id(track_id, None);
-                self.send_meta(&MetaMsgs::kSpPlaybackLoading.to_string())
-            }
-            Event::PlaybackStarted { .. } => self.send_meta(&MetaMsgs::kSpPlaybackActive.to_string()),
-            Event::SessionActive { .. } => {
-                self.handle_session_active();
-                self.send_meta(&MetaMsgs::kSpDeviceActive.to_string())
-            }
-            Event::SessionInactive { .. } => self.send_meta(&MetaMsgs::kSpDeviceInactive.to_string()),
-            Event::SinkActive { .. } => self.send_meta(&MetaMsgs::kSpSinkActive.to_string()),
-            Event::SinkInactive { .. } => self.send_meta(&MetaMsgs::kSpSinkInactive.to_string()),
-            Event::PlaybackStopped { .. } => self.send_meta(&MetaMsgs::kSpPlaybackInactive.to_string()),
-            Event::Seek { position_ms } => {
-                self.send_meta(&serde_json::to_string(&MetaMsgs::position_ms(position_ms)).unwrap());
-            }
-            Event::GotToken { token } => self.handle_token(token),
-            Event::Volume { volume_to_mixer } => {
-                let pvol = f64::from(volume_to_mixer) / f64::from(u16::max_value()) * 100.0;
-                debug!("Event::Volume({})", pvol);
-                self.send_meta(&serde_json::to_string(&MetaMsgs::volume(pvol)).unwrap());
-            }
-            _ => debug!("Unhandled Event:: {:?}", event),
-        }
-    }
-
-    fn handle_volumio_msg(&mut self) {
-        use self::PipeMsgs::*;
-        match self.buf[0] {
-            0x1 => {
-                info!("{:?}", Hello);
-            }
-            0x2 => {
-                info!("{:?}", HeartBeat);
-            }
-            0x3 => {
-                info!("{:?}", ReqToken);
-                self.request_access_token()
-            }
-            0x4 => {
-                info!("{:?}", Pause);
-                self.spirc.pause();
-                self.send_meta(&serde_json::to_string(&MetaMsgs::pong(Pause)).unwrap());
-            }
-            0x5 => {
-                info!("{:?}", Play);
-                self.spirc.play();
-            }
-            0x6 => {
-                info!("{:?}", PlayPause);
-                self.spirc.play_pause();
-            }
-            0x7 => {
-                info!("{:?}", Next);
-                self.spirc.next();
-            }
-            0x8 => {
-                info!("{:?}", Prev);
-                self.spirc.prev();
-            }
-            0x9 => {
-                let volume = self.buf[1]; // IntVolume
-                let vol = (volume as i32 * 0xFFFF / 100) as u16;
-                debug!("{:?}: {:?}[u8] => {:?}[u16]", Volume, volume, vol);
-                self.spirc.volume(vol);
-            }
-            _ => debug!("PipeMsg:: {:?}", self.buf),
-        }
-    }
-
-    fn handle_session_active(&self) {
-        info!("SessionActive!");
-    }
-
-    fn handle_token(&mut self, token: keymaster::Token) {
-        debug!("ApiToken::<{:?}>", token);
-        self.token_info = Some((
-            Instant::now(),
-            Duration::from_secs(u64::from(token.expires_in) - 120u64),
-        ));
-        self.send_meta(&serde_json::to_string(&MetaMsgs::token(token)).unwrap());
-    }
-
-    fn request_access_token(&mut self) {
-        debug!("Requesting API access token");
-        match CLIENT_ID {
-            Some(client_id) => {
-                let token = keymaster::get_token(&self.session, client_id, SCOPES)
-                    .wait()
-                    .unwrap();
-                self.handle_token(token);
-            }
-            None => warn!("Schade!"),
-        }
-    }
-
-    fn handle_track_id(&mut self, track_id: SpotifyId, position_ms: Option<u32>) {
-        if let Some(track_metadata) = self.get_metadata(track_id, position_ms) {
-            self.send_meta(&track_metadata.json.to_string());
-            self.send_meta(&"\r\n".to_string());
-        }
-    }
-
-    fn get_metadata(&mut self, spotify_id: SpotifyId, position_ms: Option<u32>) -> Option<TrackMeta> {
-        if spotify_id.audio_type == SpotifyAudioType::Track {
-            let track = Track::get(&self.session, spotify_id).wait().unwrap();
-            let album = Album::get(&self.session, track.album).wait().unwrap();
-            let artists = track
-                .artists
-                .iter()
-                .map(|artist| Artist::get(&self.session, *artist).wait().unwrap())
-                .collect::<Vec<Artist>>();
-            let covers = album
-                .covers
-                .iter()
-                .map(|cover| cover.to_base16())
-                .collect::<Vec<_>>();
-            let artist_ids = artists
-                .iter()
-                .map(|artist| artist.id.to_base62())
-                .collect::<Vec<_>>();
-            let artist_names = artists
-                .iter()
-                .map(|artist| artist.name.clone())
-                .collect::<Vec<String>>();
-            let json = json!(
-            { "metadata" : {
-                "track_id": spotify_id.to_base62(),
-                "track_name": track.name,
-                "artist_id": artist_ids,
-                "artist_name": artist_names,
-                "album_id": album.id.to_base62(),
-                "album_name": album.name,
-                "duration_ms": track.duration,
-                "albumartId": covers,
-                "position_ms": position_ms.unwrap_or(0),
-            }});
-
-            Some(TrackMeta {
-                track: Some(track),
-                album: Some(album),
-                artist: Some(artists),
-                json,
-            })
-        } else {
-            let episode = Episode::get(&self.session, spotify_id).wait().unwrap();
-            let show = Show::get(&self.session, episode.show).wait().unwrap();
-
-            let covers = episode
-                .covers
-                .iter()
-                .map(|cover| cover.to_base16())
-                .collect::<Vec<_>>();
-            let json = json!(
-            { "metadata" : {
-                "track_id": spotify_id.to_base62(),
-                "track_name": episode.name,
-                // "artist_id": artist_ids,
-                "artist_name": vec!(show.publisher),
-                "album_id": show.id.to_base62(),
-                "album_name": show.name,
-                "duration_ms": episode.duration,
-                "albumartId": covers,
-                "position_ms": position_ms.unwrap_or(0),
-            }});
-            info!("Json:: {:?}", json);
-            Some(TrackMeta {
-                track: None,
-                album: None,
-                artist: None,
-                json,
-            })
-        }
-    }
-
-    fn send_meta(&mut self, msg: &str) {
-        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), self.config.port);
-        self.udp_socket
-            .as_ref()
-            .unwrap()
-            .send_to(msg.as_bytes(), remote_addr)
-            .expect("Unable to send metadata");
+        let handle = tokio::spawn(run_meta_pipe(config, session, event_rx, spirc));
+        MetaPipe { handle }
     }
 }
 
 impl Drop for MetaPipe {
     fn drop(&mut self) {
         debug!("drop MetaPipe");
-        drop(self.task_tx.take());
-        if let Some(handle) = self.thread_handle.take() {
-            match handle.join() {
-                Ok(_) => debug!("Closed MetaPipe thread"),
-                Err(_) => error!("MetaPipe panicked!"),
+        self.handle.abort();
+    }
+}
+
+async fn run_meta_pipe(
+    config: MetaPipeConfig,
+    session: Session,
+    mut event_rx: PlayerEventChannel,
+    spirc: Arc<Spirc>,
+) {
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port + 1);
+    let socket = match UdpSocket::bind(bind_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to bind metadata socket on {}: {}", bind_addr, e);
+            return;
+        }
+    };
+    let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.port);
+
+    info!("Metadata pipe established on port {}", config.port + 1);
+    send_str(&socket, &config.version, remote_addr).await;
+
+    let mut token_info: Option<(Instant, Duration)> = None;
+    let mut device_active = false;
+    let mut buf = [0u8; 2];
+
+    loop {
+        if session.is_invalid() {
+            error!("Session no longer valid");
+            break;
+        }
+
+        // Refresh access token if expired
+        if let Some((started, duration)) = token_info {
+            if started.elapsed() > duration {
+                info!("API token expired, refreshing...");
+                token_info = request_and_send_token(&session, &socket, remote_addr).await;
             }
-        } else {
-            warn!("Unable to drop MetaPipe");
+        }
+
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(e) => {
+                        handle_event(
+                            &session, &socket, &spirc, e, remote_addr,
+                            &mut token_info, &mut device_active,
+                        )
+                        .await;
+                    }
+                    None => {
+                        warn!("Player event channel closed");
+                        break;
+                    }
+                }
+            }
+            result = socket.recv(&mut buf) => {
+                if result.is_ok() {
+                    handle_volumio_msg(&spirc, &socket, buf, remote_addr).await;
+                }
+            }
+        }
+    }
+
+    send_str(&socket, &MetaMsgs::kSpPlaybackInactive.to_string(), remote_addr).await;
+    if device_active {
+        send_str(&socket, &MetaMsgs::kSpSinkInactive.to_string(), remote_addr).await;
+        send_str(&socket, &MetaMsgs::kSpDeviceInactive.to_string(), remote_addr).await;
+    }
+}
+
+async fn handle_event(
+    session: &Session,
+    socket: &UdpSocket,
+    spirc: &Arc<Spirc>,
+    event: PlayerEvent,
+    remote_addr: SocketAddr,
+    token_info: &mut Option<(Instant, Duration)>,
+    device_active: &mut bool,
+) {
+    info!("PlayerEvent: {:?}", event);
+    match event {
+        PlayerEvent::Loading {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            send_str(socket, &MetaMsgs::kSpPlaybackLoading.to_string(), remote_addr).await;
+            handle_track_id(session, socket, track_id, Some(position_ms), remote_addr).await;
+        }
+        PlayerEvent::Playing {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            if !*device_active {
+                *device_active = true;
+                send_str(socket, &MetaMsgs::kSpDeviceActive.to_string(), remote_addr).await;
+                send_str(socket, &MetaMsgs::kSpSinkActive.to_string(), remote_addr).await;
+            }
+            send_str(
+                socket,
+                &serde_json::to_string(&MetaMsgs::state { status: "play" }).unwrap(),
+                remote_addr,
+            )
+            .await;
+            send_str(socket, &MetaMsgs::kSpPlaybackActive.to_string(), remote_addr).await;
+            handle_track_id(session, socket, track_id, Some(position_ms), remote_addr).await;
+        }
+        PlayerEvent::Paused {
+            track_id,
+            position_ms,
+            ..
+        } => {
+            send_str(
+                socket,
+                &serde_json::to_string(&MetaMsgs::state { status: "pause" }).unwrap(),
+                remote_addr,
+            )
+            .await;
+            handle_track_id(session, socket, track_id, Some(position_ms), remote_addr).await;
+        }
+        PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => {
+            send_str(socket, &MetaMsgs::kSpPlaybackInactive.to_string(), remote_addr).await;
+        }
+        PlayerEvent::Changed { new_track_id, .. } => {
+            handle_track_id(session, socket, new_track_id, None, remote_addr).await;
+        }
+        PlayerEvent::VolumeSet { volume } => {
+            let pvol = f64::from(volume) / f64::from(u16::MAX) * 100.0;
+            debug!("VolumeSet: {:.1}%", pvol);
+            send_str(
+                socket,
+                &serde_json::to_string(&MetaMsgs::volume(pvol)).unwrap(),
+                remote_addr,
+            )
+            .await;
+        }
+        _ => debug!("Unhandled PlayerEvent: {:?}", event),
+    }
+
+    let _ = (spirc, token_info); // suppress unused warnings
+}
+
+async fn handle_volumio_msg(
+    spirc: &Arc<Spirc>,
+    socket: &UdpSocket,
+    buf: [u8; 2],
+    remote_addr: SocketAddr,
+) {
+    use self::PipeMsgs::*;
+    match buf[0] {
+        0x1 => info!("{:?}", Hello),
+        0x2 => info!("{:?}", HeartBeat),
+        0x3 => {
+            info!("{:?}", ReqToken);
+            // Token will be refreshed on next loop iteration via token_info check.
+            // For immediate response, caller should trigger via event channel.
+        }
+        0x4 => {
+            info!("{:?}", Pause);
+            spirc.pause();
+            send_str(
+                socket,
+                &serde_json::to_string(&MetaMsgs::pong(Pause)).unwrap(),
+                remote_addr,
+            )
+            .await;
+        }
+        0x5 => {
+            info!("{:?}", Play);
+            spirc.play();
+        }
+        0x6 => {
+            info!("{:?}", PlayPause);
+            spirc.play_pause();
+        }
+        0x7 => {
+            info!("{:?}", Next);
+            spirc.next();
+        }
+        0x8 => {
+            info!("{:?}", Prev);
+            spirc.prev();
+        }
+        0x9 => {
+            let volume = buf[1];
+            // librespot 0.4 Spirc no longer exposes set_volume(u16); use volume_up/down
+            // as a temporary stub. A future version can route this through the mixer.
+            debug!("{:?}: {:?}[u8] — absolute volume set not yet supported", Volume, volume);
+        }
+        _ => debug!("Unknown PipeMsg: {:02x} {:02x}", buf[0], buf[1]),
+    }
+}
+
+async fn handle_track_id(
+    session: &Session,
+    socket: &UdpSocket,
+    track_id: SpotifyId,
+    position_ms: Option<u32>,
+    remote_addr: SocketAddr,
+) {
+    if let Some(json) = get_metadata(session, track_id, position_ms).await {
+        send_str(socket, &json.to_string(), remote_addr).await;
+        send_str(socket, "\r\n", remote_addr).await;
+    }
+}
+
+async fn get_metadata(
+    session: &Session,
+    spotify_id: SpotifyId,
+    position_ms: Option<u32>,
+) -> Option<Value> {
+    if spotify_id.audio_type == SpotifyAudioType::Track {
+        let track = match Track::get(session, spotify_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Error fetching track: {:?}", e);
+                return None;
+            }
+        };
+        let album = match Album::get(session, track.album).await {
+            Ok(a) => a,
+            Err(e) => {
+                error!("Error fetching album: {:?}", e);
+                return None;
+            }
+        };
+        let mut artists = Vec::new();
+        for artist_id in &track.artists {
+            match Artist::get(session, *artist_id).await {
+                Ok(a) => artists.push(a),
+                Err(e) => {
+                    error!("Error fetching artist: {:?}", e);
+                    return None;
+                }
+            }
+        }
+        let covers = album
+            .covers
+            .iter()
+            .map(|cover| cover.to_base16().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let artist_ids = artists
+            .iter()
+            .map(|artist| artist.id.to_base62().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let artist_names = artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect::<Vec<String>>();
+        Some(json!({
+            "metadata": {
+                "track_id": spotify_id.to_base62().unwrap_or_default(),
+                "track_name": track.name,
+                "artist_id": artist_ids,
+                "artist_name": artist_names,
+                "album_id": album.id.to_base62().unwrap_or_default(),
+                "album_name": album.name,
+                "duration_ms": track.duration,
+                "albumartId": covers,
+                "position_ms": position_ms.unwrap_or(0),
+            }
+        }))
+    } else {
+        let episode = match Episode::get(session, spotify_id).await {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Error fetching episode: {:?}", e);
+                return None;
+            }
+        };
+        let show = match Show::get(session, episode.show).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Error fetching show: {:?}", e);
+                return None;
+            }
+        };
+        let covers = episode
+            .covers
+            .iter()
+            .map(|cover| cover.to_base16().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let json = json!({
+            "metadata": {
+                "track_id": spotify_id.to_base62().unwrap_or_default(),
+                "track_name": episode.name,
+                "artist_name": vec![show.publisher],
+                "album_id": show.id.to_base62().unwrap_or_default(),
+                "album_name": show.name,
+                "duration_ms": episode.duration,
+                "albumartId": covers,
+                "position_ms": position_ms.unwrap_or(0),
+            }
+        });
+        info!("Episode metadata: {:?}", json);
+        Some(json)
+    }
+}
+
+async fn request_and_send_token(
+    session: &Session,
+    socket: &UdpSocket,
+    remote_addr: SocketAddr,
+) -> Option<(Instant, Duration)> {
+    match CLIENT_ID {
+        Some(client_id) => match keymaster::get_token(session, client_id, SCOPES).await {
+            Ok(token) => {
+                debug!("Got API token, expires_in={}", token.expires_in);
+                let expiry = Duration::from_secs(u64::from(token.expires_in).saturating_sub(120));
+                let msg = json!({
+                    "token": {
+                        "access_token": token.access_token,
+                        "expires_in": token.expires_in,
+                        "token_type": token.token_type,
+                        "scope": token.scope,
+                    }
+                });
+                send_str(socket, &msg.to_string(), remote_addr).await;
+                Some((Instant::now(), expiry))
+            }
+            Err(e) => {
+                error!("Failed to request access token: {:?}", e);
+                None
+            }
+        },
+        None => {
+            warn!("No CLIENT_ID compiled in — cannot fetch Spotify API token");
+            None
         }
     }
 }
 
-impl Drop for MetaPipeThread {
-    fn drop(&mut self) {
-        debug!("drop MetaPipeThread[{}]", self.session.session_id());
-        // Brute force Exit the process so that systemd can restart
-        // warn!("Exiting Vollibrespot");
-        // std::process::exit(1);
+async fn send_str(socket: &UdpSocket, msg: &str, remote_addr: SocketAddr) {
+    if let Err(e) = socket.send_to(msg.as_bytes(), remote_addr).await {
+        error!("Failed to send metadata: {}", e);
     }
 }
