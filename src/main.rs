@@ -12,26 +12,18 @@ use librespot::{
         session::Session,
     },
     discovery::Discovery,
-    playback::{
-        audio_backend::BACKENDS,
-        config::AudioFormat,
-        mixer::MixerConfig,
-        player::Player,
-    },
+    playback::{audio_backend::BACKENDS, config::AudioFormat, mixer::MixerConfig, player::Player},
 };
-use std::{
-    env,
-    io::Write,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, io::Write, sync::Arc};
 
 mod config_parser;
 mod meta_pipe;
+mod reconnect;
 mod version;
 use crate::{
     config_parser::{Config, Setup},
-    meta_pipe::{MetaPipe, MetaPipeConfig},
+    meta_pipe::MetaPipe,
+    reconnect::ReconnectPolicy,
 };
 
 fn usage(program: &str, opts: &getopts::Options) -> String {
@@ -167,7 +159,7 @@ async fn run(setup: Setup) {
     };
 
     let mut last_credentials = setup.credentials.clone();
-    let mut reconnect_delay = Duration::ZERO;
+    let mut reconnect_policy = ReconnectPolicy::default();
 
     'main: loop {
         // Get or wait for credentials
@@ -185,9 +177,9 @@ async fn run(setup: Setup) {
         };
 
         // Back-off delay on reconnect
-        if !reconnect_delay.is_zero() {
-            warn!("Reconnecting in {:?}", reconnect_delay);
-            tokio::time::sleep(reconnect_delay).await;
+        if let Some(reconnect_wait) = reconnect_policy.reconnect_wait() {
+            warn!("Reconnecting in {:?}", reconnect_wait);
+            tokio::time::sleep(reconnect_wait).await;
         }
 
         // Connect to Spotify
@@ -202,19 +194,12 @@ async fn run(setup: Setup) {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to connect to Spotify: {}", e);
-                reconnect_delay = std::cmp::min(
-                    if reconnect_delay.is_zero() {
-                        Duration::from_secs(1)
-                    } else {
-                        reconnect_delay * 2
-                    },
-                    Duration::from_secs(60),
-                );
+                reconnect_policy.note_connect_error();
                 continue;
             }
         };
         last_credentials = Some(credentials);
-        reconnect_delay = Duration::ZERO;
+        reconnect_policy.note_connected();
 
         // Setup mixer
         let mixer_config = setup.mixer_config.clone();
@@ -232,12 +217,8 @@ async fn run(setup: Setup) {
         );
 
         // Setup spirc (Spotify Remote Playback Control)
-        let (spirc, spirc_task) = Spirc::new(
-            setup.connect_config.clone(),
-            session.clone(),
-            player,
-            mixer,
-        );
+        let (spirc, spirc_task) =
+            Spirc::new(setup.connect_config.clone(), session.clone(), player, mixer);
         let spirc = Arc::new(spirc);
 
         // MetaPipe: sends metadata to Volumio over UDP
@@ -256,21 +237,18 @@ async fn run(setup: Setup) {
                 break 'main;
             }
             _ = spirc_task => {
-                warn!("Spirc shut down unexpectedly — will reconnect");
-                reconnect_delay = std::cmp::min(
-                    if reconnect_delay.is_zero() {
-                        Duration::from_secs(1)
-                    } else {
-                        reconnect_delay * 2
-                    },
-                    Duration::from_secs(60),
-                );
+                let uptime = reconnect_policy.note_spirc_disconnect();
+                if uptime.is_zero() {
+                    warn!("Spirc shut down unexpectedly — will reconnect");
+                } else {
+                    warn!("Spirc shut down unexpectedly after {:?} — will reconnect", uptime);
+                }
             }
             Some(new_creds) = optional_discovery_next(&mut discovery) => {
                 warn!("New credentials from discovery — reconnecting");
                 spirc.shutdown();
                 last_credentials = Some(new_creds);
-                reconnect_delay = Duration::ZERO;
+                reconnect_policy.reset();
             }
         }
         // _meta_pipe dropped here; its tokio task is aborted

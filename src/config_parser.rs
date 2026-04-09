@@ -201,12 +201,7 @@ impl Setup {
         let cache = config.misc.cache_location.as_ref().and_then(|loc| {
             let path = PathBuf::from(loc);
             let audio: Option<PathBuf> = if use_audio_cache { Some(path.clone()) } else { None };
-            match Cache::new(
-                Some(path.clone()),
-                Some(path.clone()),
-                audio,
-                None,
-            ) {
+            match Cache::new(Some(path.clone()), Some(path.clone()), audio, None) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     error!("Failed to open cache: {}", e);

@@ -271,7 +271,10 @@ async fn handle_volumio_msg(
             let volume = buf[1];
             // librespot 0.4 Spirc no longer exposes set_volume(u16); use volume_up/down
             // as a temporary stub. A future version can route this through the mixer.
-            debug!("{:?}: {:?}[u8] — absolute volume set not yet supported", Volume, volume);
+            debug!(
+                "{:?}: {:?}[u8] — absolute volume set not yet supported",
+                Volume, volume
+            );
         }
         _ => debug!("Unknown PipeMsg: {:02x} {:02x}", buf[0], buf[1]),
     }
